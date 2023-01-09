@@ -20,10 +20,11 @@ type Limiter struct {
 }
 
 type limitation struct {
-	block        bool
-	timerBound   *time.Timer
-	timerBlocked *time.Timer
-	requests     uint16
+	block    bool
+	blockCh  chan struct{}
+	count    uint16
+	countMax uint16
+	ticker   *time.Ticker
 }
 
 func New(cfg *config.Config) *Limiter {
@@ -45,45 +46,47 @@ func (l *Limiter) RateLimit(next http.HandlerFunc) http.HandlerFunc {
 		v, ok := l.IPs[subnet.String()]
 		if !ok {
 			limiter := &limitation{
-				block:        false,
-				timerBound:   time.NewTimer(time.Duration(l.Cfg.BoundDuration) * time.Minute),
-				timerBlocked: nil,
-				requests:     1,
+				block:    false,
+				blockCh:  make(chan struct{}),
+				count:    l.Cfg.RequestsLimit,
+				countMax: l.Cfg.RequestsLimit,
+				ticker:   time.NewTicker(time.Duration(l.Cfg.BoundDuration) * time.Minute),
 			}
 			l.IPs[subnet.String()] = limiter
 
 			go func() {
 				for {
-					if limiter.requests > l.Cfg.RequestsLimit {
-						if !limiter.timerBound.Stop() {
-							log.Println("Timer is not fired when requests equal: ", limiter.requests)
-							limiter.timerBound.Reset(time.Nanosecond)
-							break
-						}
+					if limiter.count <= 0 {
+						limiter.blockCh <- struct{}{}
+						return
+					}
+
+					select {
+					case <-limiter.ticker.C:
+						log.Println("tick fired")
+						limiter.count = limiter.countMax
+					default:
+						continue
 					}
 				}
 			}()
 
-			go func() {
-				<-limiter.timerBound.C
-				log.Println("Timer for limit was expired")
-				if limiter.requests > l.Cfg.RequestsLimit {
-					log.Printf("Request limit was exceeded: Limit(%d) , Requests(%d)", l.Cfg.RequestsLimit, limiter.requests)
-					limiter.block = true
-					limiter.timerBlocked = time.NewTimer(time.Duration(l.Cfg.BlockDuration) * time.Minute)
-					go func() {
-						<-limiter.timerBlocked.C
-						l.Mu.Lock()
-						delete(l.IPs, subnet.String())
-						l.Mu.Unlock()
-					}()
-					return
-				}
+			go func(ch chan struct{}) {
+				defer close(ch)
+				<-ch
+
+				log.Println("start block")
+
+				blockTimer := time.NewTimer(time.Duration(l.Cfg.BlockDuration) * time.Minute)
+				limiter.block = true
+
+				<-blockTimer.C
 
 				l.Mu.Lock()
 				defer l.Mu.Unlock()
 				delete(l.IPs, subnet.String())
-			}()
+
+			}(limiter.blockCh)
 
 		} else {
 			if v.block {
@@ -91,7 +94,7 @@ func (l *Limiter) RateLimit(next http.HandlerFunc) http.HandlerFunc {
 				w.Write([]byte("block requests for this IPs subnet"))
 				return
 			}
-			v.requests++
+			v.count--
 		}
 
 		next.ServeHTTP(w, r)
