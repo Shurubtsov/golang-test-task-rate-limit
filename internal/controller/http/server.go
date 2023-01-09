@@ -20,7 +20,7 @@ func (s *server) Run() error {
 	smux.Handle("/test", s.middleware.RateLimit((http.HandlerFunc(s.router.Handler))))
 
 	srv := http.Server{
-		Addr:    ":8080",
+		Addr:    ":8082",
 		Handler: smux,
 	}
 
